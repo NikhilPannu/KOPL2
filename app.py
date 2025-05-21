@@ -4,6 +4,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import datetime
 import os
+import json
 
 # --- Configuration ---
 # Replace with your actual Google Sheet URL
@@ -13,68 +14,74 @@ WORKSHEET_NAME = "PRD"  # e.g., "Production Log" or whatever your tab is named
 
 
 # --- Google Sheets Connection ---
-@st.cache_data(ttl=3600)  # Cache data for 1 hour to reduce API calls
+@st.cache_data(ttl=3600)
 def get_google_sheet_data():
-    client = None  # Initialize client to None
+    client = None
 
-    # Attempt to use Streamlit secrets first
     if "gcp_service_account" in st.secrets:
         try:
-            creds_dict = st.secrets["gcp_service_account"]
-            # Ensure creds_dict is a dictionary (Streamlit Cloud parses TOML to dict)
-            if not isinstance(creds_dict, dict):
-                st.warning("Streamlit secret 'gcp_service_account' is not a valid dictionary. Attempting local credentials.")
-            else:
+            # Get the string from secrets
+            creds_str = st.secrets["gcp_service_account"]
+            if isinstance(creds_str, str):
+                # Parse the string into a Python dictionary
+                creds_dict = json.loads(creds_str) # <--- PARSE THE JSON STRING
                 client = gspread.service_account_from_dict(creds_dict)
-                # st.info("Using Streamlit secrets for Google Sheets.") # Optional: for debugging
+                # st.info("Using Streamlit secrets for Google Sheets (parsed from string).")
+            elif isinstance(creds_str, dict): # Should not happen if TOML is a string, but good check
+                client = gspread.service_account_from_dict(creds_str)
+                # st.info("Using Streamlit secrets for Google Sheets (already a dict).")
+            else:
+                st.warning(f"Streamlit secret 'gcp_service_account' is of unexpected type: {type(creds_str)}. Attempting local credentials.")
+
+        except json.JSONDecodeError as json_e:
+            st.warning(f"Error decoding JSON from Streamlit secret 'gcp_service_account': {json_e}. Content might not be valid JSON. Attempting local credentials.")
+            client = None
         except Exception as e:
             st.warning(f"Error initializing client from Streamlit secrets: {e}. Attempting local credentials.")
-            client = None # Ensure client is None if secrets method fails
+            client = None
     else:
         st.info("Streamlit secret 'gcp_service_account' not found. Attempting local 'credentials.json'.")
 
-    # If client is still None (secrets not found or failed), try local credentials.json
+    # ... (rest of your function for local credentials and sheet opening remains the same)
     if client is None:
         if not os.path.exists("credentials.json"):
             st.error("Local 'credentials.json' file not found. Cannot connect to Google Sheets.")
-            return pd.DataFrame() # Return empty DataFrame as a fallback
+            # Stop execution or return empty DataFrame
+            st.stop() # Or return pd.DataFrame() if you want to handle it downstream
+            # return pd.DataFrame()
 
         try:
             scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
             local_creds = Credentials.from_service_account_file("credentials.json", scopes=scope)
             client = gspread.authorize(local_creds)
-            # st.info("Using local 'credentials.json' for Google Sheets.") # Optional: for debugging
+            # st.info("Using local 'credentials.json' for Google Sheets.")
         except Exception as e:
             st.error(f"Error loading local 'credentials.json': {e}")
-            return pd.DataFrame() # Return empty DataFrame
+            st.stop() # Or return pd.DataFrame()
+            # return pd.DataFrame()
 
-    # If client is still None at this point, something went wrong with both methods
     if client is None:
         st.error("Failed to initialize Google Sheets client using both Streamlit secrets and local credentials.")
-        return pd.DataFrame()
+        st.stop() # Or return pd.DataFrame()
+        # return pd.DataFrame()
 
-    # Proceed to fetch data from the Google Sheet
     try:
         spreadsheet = client.open_by_url(GOOGLE_SHEET_URL)
         worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
         records = worksheet.get_all_records()
-        # If sheet is empty, get_all_records() returns an empty list,
-        # pd.DataFrame([]) is an empty DataFrame, which is fine.
         return pd.DataFrame(records)
     except gspread.exceptions.SpreadsheetNotFound:
         st.error(f"Spreadsheet not found. Check the GOOGLE_SHEET_URL: {GOOGLE_SHEET_URL}")
-        return pd.DataFrame()
+        return pd.DataFrame() # Or st.stop()
     except gspread.exceptions.WorksheetNotFound:
         st.error(f"Worksheet '{WORKSHEET_NAME}' not found in the spreadsheet. Check WORKSHEET_NAME.")
-        return pd.DataFrame()
+        return pd.DataFrame() # Or st.stop()
     except gspread.exceptions.APIError as api_e:
-        st.error(f"Google Sheets API Error: {api_e}. "
-                 "This could be due to insufficient permissions for the service account on the sheet, "
-                 "or incorrect API enabling in Google Cloud Console.")
-        return pd.DataFrame()
+        st.error(f"Google Sheets API Error: {api_e}. Check service account permissions or API enabling.")
+        return pd.DataFrame() # Or st.stop()
     except Exception as sheet_error:
         st.error(f"An unexpected error occurred while accessing the Google Sheet: {sheet_error}")
-        return pd.DataFrame()
+        return pd.DataFrame() # Or st.stop()
 
 
 # --- Data Loading and Preprocessing ---
