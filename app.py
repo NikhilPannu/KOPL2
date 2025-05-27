@@ -15,39 +15,38 @@ warnings.filterwarnings('ignore')
 
 # --- Configuration ---
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/18ZbDcL0e053w1-IbxX-OflUOs1z07QTcQYUHtLGwl1k/edit?gid=0#gid=0"
-WORKSHEET_NAME = "PRD"
+WORKSHEET_NAMES_MAP = {
+    "prd": "PRD",
+    "breakdown_form": "Form Responses 1"
+}
 
 
 # --- Google Sheets Connection ---
 @st.cache_data(ttl=3600)
-def get_google_sheet_data():
+def get_google_sheets_data(sheet_url, sheet_names_map):
     client = None
-
-    # Try Streamlit secrets first (only if they exist)
     try:
         if hasattr(st, 'secrets') and st.secrets and "gcp_service_account" in st.secrets:
             creds_str = st.secrets["gcp_service_account"]
             if isinstance(creds_str, str):
                 creds_dict = json.loads(creds_str)
-                client = gspread.service_account_from_dict(creds_dict)
             elif isinstance(creds_str, dict):
-                client = gspread.service_account_from_dict(creds_str)
+                creds_dict = creds_str
             else:
                 st.warning(
                     f"Streamlit secret 'gcp_service_account' is of unexpected type: {type(creds_str)}. Attempting local credentials.")
+                creds_dict = None  # Fallback
+            if creds_dict:
+                client = gspread.service_account_from_dict(creds_dict)
     except Exception as e:
         st.info(f"Streamlit secrets not available or invalid: {e}. Attempting local credentials.")
         client = None
 
-    # Fallback to local credentials
     if client is None:
         if not os.path.exists("credentials.json"):
-            st.error("❌ **Authentication Required**: Please provide either:")
-            st.error("1. A 'credentials.json' file in the project directory, OR")
-            st.error("2. Configure Streamlit secrets with 'gcp_service_account'")
-            st.error("📖 **Setup Instructions**: Check the Google Sheets API documentation for service account setup.")
+            st.error(
+                "❌ **Authentication Required**: Provide 'credentials.json' or configure Streamlit secrets 'gcp_service_account'.")
             st.stop()
-
         try:
             scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
             local_creds = Credentials.from_service_account_file("credentials.json", scopes=scope)
@@ -57,100 +56,298 @@ def get_google_sheet_data():
             st.error(f"❌ Error loading local 'credentials.json': {e}")
             st.stop()
 
+    dataframes = {}
+    all_sheets_loaded_successfully = True
     try:
-        spreadsheet = client.open_by_url(GOOGLE_SHEET_URL)
-        worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
-        data = worksheet.get_all_values()
+        spreadsheet = client.open_by_url(sheet_url)
+        for key, sheet_name in sheet_names_map.items():
+            try:
+                worksheet = spreadsheet.worksheet(sheet_name)
+                data = worksheet.get_all_values()
+                if not data or len(data) < 1:
+                    st.warning(f"No data found in worksheet '{sheet_name}'. An empty DataFrame will be used.")
+                    dataframes[key] = pd.DataFrame()
+                    continue
 
-        if not data or len(data) < 1:
-            st.warning("No data found in the worksheet.")
-            return pd.DataFrame()
-
-        headers = data[0]
-        records = data[1:]
-        df = pd.DataFrame(records, columns=headers)
-        df.replace('', np.nan, inplace=True)
-
-        st.success(f"✅ Data loaded successfully: {len(df)} records from '{WORKSHEET_NAME}'")
-        return df
+                headers = data[0]
+                records = data[1:]
+                df = pd.DataFrame(records, columns=headers)
+                df.replace('', np.nan, inplace=True)  # Replace all empty strings with NaN
+                dataframes[key] = df
+                st.success(f"✅ Data loaded: {len(df)} records from '{sheet_name}'")
+            except gspread.exceptions.WorksheetNotFound:
+                st.error(f"❌ Worksheet '{sheet_name}' not found. An empty DataFrame will be used for this sheet.")
+                dataframes[key] = pd.DataFrame()
+                if key == "prd":  # PRD sheet is critical
+                    all_sheets_loaded_successfully = False
+            except Exception as ws_e:
+                st.error(f"❌ Error loading worksheet '{sheet_name}': {ws_e}")
+                dataframes[key] = pd.DataFrame()
+                if key == "prd":
+                    all_sheets_loaded_successfully = False
+        return dataframes, all_sheets_loaded_successfully
 
     except gspread.exceptions.SpreadsheetNotFound:
-        st.error(f"❌ Spreadsheet not found. Check the GOOGLE_SHEET_URL: {GOOGLE_SHEET_URL}")
-        return pd.DataFrame()
-    except gspread.exceptions.WorksheetNotFound:
-        st.error(f"❌ Worksheet '{WORKSHEET_NAME}' not found in the spreadsheet.")
-        return pd.DataFrame()
+        st.error(f"❌ Spreadsheet not found. Check GOOGLE_SHEET_URL: {sheet_url}")
+        return {key: pd.DataFrame() for key in sheet_names_map}, False
     except gspread.exceptions.APIError as api_e:
         st.error(f"❌ Google Sheets API Error: {api_e}")
-        return pd.DataFrame()
+        return {key: pd.DataFrame() for key in sheet_names_map}, False
     except Exception as sheet_error:
         st.error(f"❌ Unexpected error accessing Google Sheet: {sheet_error}")
-        return pd.DataFrame()
+        return {key: pd.DataFrame() for key in sheet_names_map}, False
 
 
 # --- Enhanced Data Processing ---
 @st.cache_data(ttl=3600)
-def process_data(df):
-    if df.empty:
-        return df
+def process_data(df_prd_raw, df_breakdown_form_raw):
+    if df_prd_raw.empty:
+        st.error("PRD data is empty. Cannot proceed with processing.")
+        return pd.DataFrame()
 
-    # Date processing
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    df_prd = df_prd_raw.copy()
+    df_breakdown_form = df_breakdown_form_raw.copy()
 
-    # Time processing
-    for col in ['Machine start time', 'Machine End time']:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], format='%H:%M:%S', errors='coerce').dt.time
+    st.write("Initial PRD columns:", df_prd.columns.tolist())
+    if not df_breakdown_form.empty:
+        st.write("Initial Breakdown Form columns:", df_breakdown_form.columns.tolist())
 
-    # Numeric columns processing
-    numeric_cols = [
-        'Running time', 'Process time (Machining)', 'Process time (Setup)',
-        'Mfg qty', 'Rejected qty', 'Approved qty', 'Total Cycle time',
-        'Breakdown duration (in minutes)', 'Unreported time'
-    ]
+    # --- Process PRD Data ---
+    # Ensure Record ID is string and handle potential NaN before type conversion
+    if 'Record ID' in df_prd.columns:
+        df_prd['Record ID'] = df_prd['Record ID'].astype(str).fillna('Unknown_Record_ID')
+    else:
+        st.error("'Record ID' column is missing in PRD sheet. This is crucial for merging.")
+        df_prd['Record ID'] = 'Unknown_Record_ID_Placeholder'  # Add placeholder to avoid crashing
 
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    df_prd['Date'] = pd.to_datetime(df_prd['Date'], errors='coerce', dayfirst=True)
+
+    time_cols_prd = ['Machine start time', 'Machine End time']
+    for col in time_cols_prd:
+        if col in df_prd.columns:
+            df_prd[col] = pd.to_datetime(df_prd[col], format='%H:%M:%S', errors='coerce').dt.time
         else:
-            df[col] = 0
+            df_prd[col] = None  # or pd.NaT based on desired handling
 
-    # Enhanced KPI calculations
-    df['Total Process Time'] = df['Process time (Machining)'] + df['Process time (Setup)']
+    # Store original PRD breakdown info before it's potentially modified by mappings or merged data
+    if 'Breakdown duration (in minutes)' in df_prd.columns:
+        df_prd['PRD_Original_Breakdown_Duration'] = pd.to_numeric(df_prd['Breakdown duration (in minutes)'],
+                                                                  errors='coerce').fillna(0)
+    else:
+        df_prd['PRD_Original_Breakdown_Duration'] = 0
 
-    # Yield Rate (safe division)
-    df['Yield Rate'] = np.where(df['Mfg qty'] > 0,
-                                (df['Approved qty'] / df['Mfg qty']) * 100, 0)
+    if 'Breakdown (entry)' in df_prd.columns:
+        df_prd['PRD_Original_Breakdown_Entry'] = df_prd['Breakdown (entry)'].astype(str).fillna('Not Specified')
+    else:
+        df_prd['PRD_Original_Breakdown_Entry'] = 'Not Specified'
 
-    # Rejection Rate
-    df['Rejection Rate'] = np.where(df['Mfg qty'] > 0,
-                                    (df['Rejected qty'] / df['Mfg qty']) * 100, 0)
-
-    # Machine Utilization (Enhanced)
-    total_available_time = df['Running time'] + df['Breakdown duration (in minutes)'] + df['Unreported time']
-    df['Machine Utilization'] = np.where(total_available_time > 0,
-                                         (df['Running time'] / total_available_time) * 100, 0)
-
-    # Productivity Rate (parts per hour)
-    df['Productivity Rate'] = np.where(df['Running time'] > 0,
-                                       (df['Approved qty'] / (df['Running time'] / 60)), 0)
-
-    # Fill missing categorical data
-    categorical_cols = ['Breakdown (entry)', 'Item code', 'Item name', 'Operator name', 'Shift']
-    for col in categorical_cols:
-        if col in df.columns:
-            df[col] = df[col].fillna('Not Specified')
+    numeric_columns_mapping_prd = {
+        # Standard Name : [Possible Original Names in Sheet]
+        'Running time': ['Running time', 'running time', 'Machine running time'],
+        'Process time (Machining)': ['Process time (Machining)', 'Machining time', 'Process time'],
+        'Process time (Setup)': ['Process time (Setup)', 'Setup time'],
+        'Mfg qty': ['Mfg qty', 'Manufacturing qty', 'Manufactured qty'],
+        'Rejected qty': ['Rejected qty', 'Reject qty', 'Rejection qty'],
+        'Approved qty': ['Approved qty', 'Good qty', 'Accepted qty'],
+        'Total Cycle time': ['Total Cycle time', 'Cycle time'],
+        'Unreported time': ['Unreported time', 'Unaccounted time'],
+        # PRD's own breakdown duration is handled by PRD_Original_Breakdown_Duration
+    }
+    for standard_col, possible_cols in numeric_columns_mapping_prd.items():
+        found_col = None
+        for col_variant in possible_cols:
+            if col_variant in df_prd.columns:
+                found_col = col_variant
+                break
+        if found_col:
+            df_prd[standard_col] = pd.to_numeric(df_prd[found_col], errors='coerce').fillna(0)
         else:
-            df[col] = 'Not Specified'
+            df_prd[standard_col] = 0
+            if standard_col in ['Running time']:  # Critical for many calcs
+                st.warning(
+                    f"Critical numeric column '{standard_col}' (or its variants) not found in PRD sheet. Defaulting to 0.")
 
-    return df
+    categorical_columns_mapping_prd = {
+        'Machine number': ['Machine number', 'Machine', 'Machine ID'],
+        'Shift': ['Shift', 'Shift name'],
+        'BMR Number': ['BMR Number', 'BMR No'],
+        'Item code': ['Item code', 'Product code', 'Part code'],
+        'Item name': ['Item name', 'Product name', 'Part name'],
+        'Operation or Process description': ['Operation or Process description', 'Process Description',
+                                             'Operation Description'],
+        'Operator name': ['Operator name', 'Operator', 'Worker name'],
+        'verified by': ['verified by', 'Verified By', 'Checked By'],
+        'Report Breakdown': ['Report Breakdown', 'Breakdown Reported in PRD', 'PRD Breakdown'],
+        # e.g. Yes/No if breakdown noted in PRD
+        # PRD's own breakdown entry is handled by PRD_Original_Breakdown_Entry
+    }
+    for standard_col, possible_cols in categorical_columns_mapping_prd.items():
+        found_col = None
+        for col_variant in possible_cols:
+            if col_variant in df_prd.columns:
+                found_col = col_variant
+                break
+        if found_col:
+            df_prd[standard_col] = df_prd[found_col].astype(str).fillna('Not Specified')
+            if standard_col != found_col:  # Rename to standard if different
+                df_prd.drop(columns=[found_col], inplace=True, errors='ignore')
+        else:
+            df_prd[standard_col] = 'Not Specified'
+            # st.warning(f"Categorical column '{standard_col}' (or its variants) not found in PRD sheet. Defaulting to 'Not Specified'.")
+
+    # Handle 'Remark (if any)' separately as it can be blank
+    if 'Remark (if any)' in df_prd.columns:
+        df_prd['Remark (if any)'] = df_prd['Remark (if any)'].astype(str).fillna('')
+    else:
+        df_prd['Remark (if any)'] = ''
+
+    # --- Process Breakdown Form Data ---
+    df_breakdown_agg = pd.DataFrame()  # Initialize empty
+    if not df_breakdown_form.empty and 'Record ID' in df_breakdown_form.columns and 'Breakdown START TIME' in df_breakdown_form.columns and 'Breakdown END TIME' in df_breakdown_form.columns:
+        df_bd_form = df_breakdown_form.copy()
+        df_bd_form.rename(columns={  # Standardize form column names
+            'Timestamp': 'Form_Timestamp',
+            'Record ID': 'Form_Record_ID',
+            'Breakdown START TIME': 'Form_BD_Start',
+            'Breakdown END TIME': 'Form_BD_End',
+            'Breakdown REASON': 'Form_BD_Reason',
+            'Breakdown REPORTED BY': 'Form_BD_Reported_By'
+        }, inplace=True)
+
+        df_bd_form['Form_Record_ID'] = df_bd_form['Form_Record_ID'].astype(str).fillna('Unknown_Form_Record_ID')
+        df_bd_form['Form_Timestamp'] = pd.to_datetime(df_bd_form['Form_Timestamp'], errors='coerce')
+
+        # Merge with PRD to get the Date for breakdown time calculations
+        # Ensure 'Date' from df_prd is available and valid before merging
+        if 'Date' not in df_prd.columns or df_prd['Date'].isnull().all():
+            st.warning(
+                "PRD 'Date' column is missing or all null. Cannot accurately calculate breakdown durations from form.")
+        else:
+            # Only merge necessary columns to avoid conflicts, PRD 'Date' is crucial.
+            df_bd_form_dated = pd.merge(df_bd_form,
+                                        df_prd[['Record ID', 'Date']].rename(columns={'Record ID': 'Form_Record_ID'}),
+                                        on='Form_Record_ID',
+                                        how='left')
+            df_bd_form_dated.dropna(subset=['Date'], inplace=True)  # Drop if no matching PRD date
+
+            if not df_bd_form_dated.empty:
+                # Helper to combine date and time string/object
+                def combine_date_time(s_date, s_time_str):
+                    s_time_str = s_time_str.astype(str)
+                    # Attempt to parse time, handling potential AM/PM or 24hr format issues robustly
+                    # Common formats: HH:MM:SS, HH:MM, H:MM AM/PM
+                    return pd.to_datetime(s_date.dt.strftime('%Y-%m-%d') + ' ' + s_time_str, errors='coerce')
+
+                df_bd_form_dated['Form_BD_Start_dt'] = combine_date_time(df_bd_form_dated['Date'],
+                                                                         df_bd_form_dated['Form_BD_Start'])
+                df_bd_form_dated['Form_BD_End_dt'] = combine_date_time(df_bd_form_dated['Date'],
+                                                                       df_bd_form_dated['Form_BD_End'])
+
+                # Handle end times past midnight
+                mask_midnight_span = (df_bd_form_dated['Form_BD_End_dt'].notna()) & \
+                                     (df_bd_form_dated['Form_BD_Start_dt'].notna()) & \
+                                     (df_bd_form_dated['Form_BD_End_dt'] < df_bd_form_dated['Form_BD_Start_dt'])
+                df_bd_form_dated.loc[mask_midnight_span, 'Form_BD_End_dt'] += pd.Timedelta(days=1)
+
+                df_bd_form_dated['Form_BD_Duration_Minutes_Calc'] = (df_bd_form_dated['Form_BD_End_dt'] -
+                                                                     df_bd_form_dated[
+                                                                         'Form_BD_Start_dt']).dt.total_seconds() / 60
+                df_bd_form_dated['Form_BD_Duration_Minutes_Calc'] = df_bd_form_dated[
+                    'Form_BD_Duration_Minutes_Calc'].apply(lambda x: max(0, x) if pd.notnull(x) else 0)
+
+                # Aggregate form breakdown data by Record ID
+                df_breakdown_agg = df_bd_form_dated.groupby('Form_Record_ID').agg(
+                    Total_Form_Breakdown_Duration_Minutes=('Form_BD_Duration_Minutes_Calc', 'sum'),
+                    Form_Breakdown_Reasons=('Form_BD_Reason', lambda x: '; '.join(
+                        x.dropna().astype(str).unique()) if not x.dropna().empty else 'Not Specified'),
+                    Form_Breakdown_Reported_By=('Form_BD_Reported_By', lambda x: '; '.join(
+                        x.dropna().astype(str).unique()) if not x.dropna().empty else 'Not Specified'),
+                    Form_Breakdown_Count=('Form_BD_Reason', 'count')
+                ).reset_index()
+    else:
+        st.info(
+            "Breakdown form data is empty or missing key columns ('Record ID', 'Breakdown START TIME', 'Breakdown END TIME'). Using PRD breakdown data if available.")
+
+    # --- Merge PRD with Aggregated Breakdown Form Data ---
+    if not df_breakdown_agg.empty:
+        df_merged = pd.merge(df_prd, df_breakdown_agg, left_on='Record ID', right_on='Form_Record_ID', how='left')
+        if 'Form_Record_ID' in df_merged.columns:  # Drop redundant key column
+            df_merged.drop(columns=['Form_Record_ID'], inplace=True)
+    else:
+        df_merged = df_prd.copy()  # No form data to merge
+        # Ensure columns that would come from form_agg are present if expected later
+        df_merged['Total_Form_Breakdown_Duration_Minutes'] = 0
+        df_merged['Form_Breakdown_Reasons'] = 'Not Specified'
+        df_merged['Form_Breakdown_Reported_By'] = 'Not Specified'
+        df_merged['Form_Breakdown_Count'] = 0
+
+    # Fill NaNs for columns that came from the merge (if any rows in PRD didn't have a match in form)
+    df_merged['Total_Form_Breakdown_Duration_Minutes'].fillna(0, inplace=True)
+    df_merged['Form_Breakdown_Reasons'].fillna('Not Specified', inplace=True)
+    df_merged['Form_Breakdown_Reported_By'].fillna('Not Specified', inplace=True)
+    df_merged['Form_Breakdown_Count'].fillna(0, inplace=True)
+
+    # --- Consolidate Breakdown Information ---
+    # Prioritize form data. If no form data (Form_Breakdown_Count == 0), use PRD's original breakdown data.
+    df_merged['Breakdown duration (in minutes)'] = np.where(
+        df_merged['Form_Breakdown_Count'] > 0,
+        df_merged['Total_Form_Breakdown_Duration_Minutes'],
+        df_merged['PRD_Original_Breakdown_Duration']
+    )
+    df_merged['Breakdown (entry)'] = np.where(
+        df_merged['Form_Breakdown_Count'] > 0,
+        df_merged['Form_Breakdown_Reasons'],
+        df_merged['PRD_Original_Breakdown_Entry']
+    )
+    # Ensure these are correct type after np.where
+    df_merged['Breakdown duration (in minutes)'] = pd.to_numeric(df_merged['Breakdown duration (in minutes)'],
+                                                                 errors='coerce').fillna(0)
+    df_merged['Breakdown (entry)'] = df_merged['Breakdown (entry)'].astype(str).fillna('Not Specified')
+
+    # --- Final KPI Calculations ---
+    df_merged['Total Process Time'] = df_merged['Process time (Machining)'] + df_merged['Process time (Setup)']
+    df_merged['Yield Rate'] = np.where(df_merged['Mfg qty'] > 0,
+                                       (df_merged['Approved qty'] / df_merged['Mfg qty']) * 100, 0)
+    df_merged['Rejection Rate'] = np.where(df_merged['Mfg qty'] > 0,
+                                           (df_merged['Rejected qty'] / df_merged['Mfg qty']) * 100, 0)
+
+    # Machine Utilization: Ensure all components are numeric
+    running_time = pd.to_numeric(df_merged['Running time'], errors='coerce').fillna(0)
+    breakdown_duration = pd.to_numeric(df_merged['Breakdown duration (in minutes)'], errors='coerce').fillna(0)
+    unreported_time = pd.to_numeric(df_merged['Unreported time'], errors='coerce').fillna(0)
+    total_available_time = running_time + breakdown_duration + unreported_time
+    df_merged['Machine Utilization'] = np.where(total_available_time > 0, (running_time / total_available_time) * 100,
+                                                0)
+
+    df_merged['Productivity Rate'] = np.where(running_time > 0, (df_merged['Approved qty'] / (running_time / 60)),
+                                              0)  # Parts per hour
+
+    # Flag for missing breakdown form entries if PRD indicated a breakdown
+    if 'Report Breakdown' in df_merged.columns:  # Check if column exists
+        df_merged['Missing_Form_Entry'] = (
+                df_merged['Report Breakdown'].str.lower().isin(['yes', 'y', 'true']) & (
+                    df_merged['Form_Breakdown_Count'] == 0)
+        )
+    else:
+        df_merged['Missing_Form_Entry'] = False
+
+    st.write("Processed columns:", df_merged.columns.tolist())
+    # st.dataframe(df_merged.head()) # For debugging processed data
+
+    return df_merged
 
 
-# --- Executive Summary Functions ---
+# --- Executive Summary Functions (largely unchanged, but will use processed data) ---
 def create_executive_kpis(df):
     """Create executive-level KPIs"""
     total_records = len(df)
-    date_range = f"{df['Date'].min().strftime('%Y-%m-%d')} to {df['Date'].max().strftime('%Y-%m-%d')}"
+
+    valid_dates = df['Date'].dropna()
+    date_range = "No valid dates"
+    if not valid_dates.empty:
+        min_d, max_d = valid_dates.min(), valid_dates.max()
+        if pd.notna(min_d) and pd.notna(max_d):
+            date_range = f"{min_d.strftime('%Y-%m-%d')} to {max_d.strftime('%Y-%m-%d')}"
 
     # Key metrics
     total_production = df['Mfg qty'].sum()
@@ -161,12 +358,15 @@ def create_executive_kpis(df):
 
     # Time metrics
     total_breakdown_hours = df['Breakdown duration (in minutes)'].sum() / 60
-    total_unreported_hours = df['Unreported time'].sum() / 60
-    total_running_hours = df['Running time'].sum() / 60
+    total_unreported_hours = df['Unreported time'].sum() / 60  # Assuming 'Unreported time' is in minutes
+    total_running_hours = df['Running time'].sum() / 60  # Assuming 'Running time' is in minutes
 
     # Efficiency metrics
-    avg_machine_utilization = df['Machine Utilization'].mean()
-    avg_productivity = df['Productivity Rate'].mean()
+    avg_machine_utilization = df['Machine Utilization'].mean() if not df['Machine Utilization'].empty else 0
+    avg_productivity = df['Productivity Rate'].mean() if not df['Productivity Rate'].empty else 0
+
+    # New KPI: Missing Form Entries
+    missing_form_entries_count = df['Missing_Form_Entry'].sum() if 'Missing_Form_Entry' in df.columns else 0
 
     return {
         'total_records': total_records,
@@ -180,65 +380,79 @@ def create_executive_kpis(df):
         'total_unreported_hours': total_unreported_hours,
         'total_running_hours': total_running_hours,
         'avg_machine_utilization': avg_machine_utilization,
-        'avg_productivity': avg_productivity
+        'avg_productivity': avg_productivity,
+        'missing_form_entries_count': missing_form_entries_count
     }
 
 
 def create_pareto_chart(df, category_col, value_col, title, top_n=10):
-    """Create Pareto chart for top issues"""
-    grouped = df.groupby(category_col)[value_col].sum().sort_values(ascending=False).head(top_n)
+    if category_col not in df.columns or value_col not in df.columns:
+        st.warning(f"Pareto chart: Missing '{category_col}' or '{value_col}'.")
+        return None
+    if df[value_col].sum() == 0:  # No data to plot
+        # st.info(f"Pareto chart: No data for '{value_col}'.")
+        return None
+
+    grouped = df.groupby(category_col)[value_col].sum().sort_values(ascending=False)
+    grouped = grouped[grouped > 0].head(top_n)  # Only positive values and top N
+
+    if grouped.empty:
+        return None
+
     cumulative_pct = (grouped.cumsum() / grouped.sum() * 100)
-
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-
-    # Bar chart
-    fig.add_trace(
-        go.Bar(x=grouped.index, y=grouped.values, name=value_col, marker_color='steelblue'),
-        secondary_y=False,
-    )
-
-    # Cumulative percentage line
-    fig.add_trace(
-        go.Scatter(x=grouped.index, y=cumulative_pct.values, mode='lines+markers',
-                   name='Cumulative %', line=dict(color='red', width=2)),
-        secondary_y=True,
-    )
-
+    fig.add_trace(go.Bar(x=grouped.index, y=grouped.values, name=value_col, marker_color='steelblue'),
+                  secondary_y=False)
+    fig.add_trace(go.Scatter(x=grouped.index, y=cumulative_pct.values, mode='lines+markers', name='Cumulative %',
+                             line=dict(color='red', width=2)), secondary_y=True)
     fig.update_xaxes(title_text=category_col)
     fig.update_yaxes(title_text=value_col, secondary_y=False)
-    fig.update_yaxes(title_text="Cumulative Percentage", secondary_y=True, range=[0, 100])
+    fig.update_yaxes(title_text="Cumulative Percentage", secondary_y=True, range=[0, 100.5])  # Ensure 100% is visible
     fig.update_layout(title_text=title, showlegend=True)
-
     return fig
 
 
 def create_trend_analysis(df, date_col, metrics, title):
-    """Create multi-metric trend analysis"""
-    daily_data = df.groupby(df[date_col].dt.date).agg({
-        metric: 'sum' if metric in ['Breakdown duration (in minutes)', 'Unreported time', 'Rejected qty']
-        else 'mean' for metric in metrics
-    }).reset_index()
+    if date_col not in df.columns:
+        st.warning(f"Trend analysis: Missing date column '{date_col}'.")
+        return None
+
+    valid_dates_df = df[df[date_col].notna()]
+    if valid_dates_df.empty:
+        return None
+
+    # Ensure metrics exist in df
+    valid_metrics = [m for m in metrics if m in df.columns]
+    if not valid_metrics:
+        st.warning("Trend analysis: None of the specified metrics found in data.")
+        return None
+
+    agg_dict = {
+        metric: 'sum' if metric in ['Breakdown duration (in minutes)', 'Unreported time', 'Rejected qty', 'Mfg qty',
+                                    'Approved qty']
+        else 'mean' for metric in valid_metrics
+    }
+
+    # Group by date part of datetime column
+    daily_data = valid_dates_df.groupby(valid_dates_df[date_col].dt.date).agg(agg_dict).reset_index()
+    daily_data.rename(columns={date_col: 'Date_Axis'}, inplace=True)  # Rename to avoid conflict if 'Date' is a metric
+
+    if daily_data.empty:
+        return None
 
     fig = go.Figure()
-
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
-    for i, metric in enumerate(metrics):
-        fig.add_trace(go.Scatter(
-            x=daily_data[date_col],
-            y=daily_data[metric],
-            mode='lines+markers',
-            name=metric,
-            line=dict(color=colors[i % len(colors)])
-        ))
-
-    fig.update_layout(
-        title=title,
-        xaxis_title="Date",
-        yaxis_title="Value",
-        showlegend=True,
-        height=400
-    )
-
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22',
+              '#17becf']
+    for i, metric in enumerate(valid_metrics):
+        if metric in daily_data.columns:
+            fig.add_trace(go.Scatter(
+                x=daily_data['Date_Axis'],
+                y=daily_data[metric],
+                mode='lines+markers',
+                name=metric,
+                line=dict(color=colors[i % len(colors)])
+            ))
+    fig.update_layout(title=title, xaxis_title="Date", yaxis_title="Value", showlegend=True, height=400)
     return fig
 
 
@@ -255,55 +469,80 @@ st.markdown("""
 
 # Load and process data
 with st.spinner("🔄 Loading data from Google Sheets..."):
-    df_raw = get_google_sheet_data()
+    all_data_dict, sheets_loaded_status = get_google_sheets_data(GOOGLE_SHEET_URL, WORKSHEET_NAMES_MAP)
 
-if df_raw.empty:
+if not sheets_loaded_status or all_data_dict["prd"].empty:
+    st.error("❌ Critical PRD data could not be loaded. Dashboard cannot proceed.")
     st.stop()
 
-df_processed = process_data(df_raw.copy())
-df_processed = df_processed.sort_values(by='Date').reset_index(drop=True)
+df_prd_raw = all_data_dict.get("prd", pd.DataFrame())
+df_breakdown_form_raw = all_data_dict.get("breakdown_form", pd.DataFrame())
+
+with st.spinner("⚙️ Processing data... This may take a moment."):
+    df_processed = process_data(df_prd_raw, df_breakdown_form_raw)
+
+if df_processed.empty:
+    st.error("❌ Data processing failed or resulted in an empty dataset.")
+    st.stop()
+
+# Sort by date for trend analyses
+df_processed = df_processed.sort_values(by='Date', ascending=True).reset_index(drop=True)
 
 # Sidebar Filters
 st.sidebar.markdown("## 🎛️ Filters")
 
 # Date filter
-if not df_processed['Date'].isna().all():
-    min_date = df_processed['Date'].min().date()
-    max_date = df_processed['Date'].max().date()
+valid_dates_for_filter = df_processed['Date'].dropna()
+if not valid_dates_for_filter.empty:
+    min_date_filter = valid_dates_for_filter.min().date()
+    max_date_filter = valid_dates_for_filter.max().date()
+    if min_date_filter > max_date_filter:  # Should not happen if data is sorted
+        min_date_filter, max_date_filter = max_date_filter, min_date_filter  # Swap
 
-    date_range = st.sidebar.date_input(
+    date_range_selected = st.sidebar.date_input(
         "📅 Select Date Range",
-        value=(min_date, max_date),
-        min_value=min_date,
-        max_value=max_date
+        value=(min_date_filter, max_date_filter),
+        min_value=min_date_filter,
+        max_value=max_date_filter,
+        key="date_filter"
     )
+    if len(date_range_selected) == 2:
+        start_date_filter, end_date_filter = date_range_selected
+        # Ensure start_date is not after end_date from picker
+        if start_date_filter > end_date_filter:
+            start_date_filter, end_date_filter = end_date_filter, start_date_filter  # Swap
 
-    if len(date_range) == 2:
-        start_date, end_date = date_range
         df_filtered = df_processed[
-            (df_processed['Date'].dt.date >= start_date) &
-            (df_processed['Date'].dt.date <= end_date)
+            (df_processed['Date'].dt.date >= start_date_filter) &
+            (df_processed['Date'].dt.date <= end_date_filter)
             ]
-    else:
-        df_filtered = df_processed
+    else:  # Should be 2, but as a fallback
+        df_filtered = df_processed.copy()
 else:
-    df_filtered = df_processed
-    st.sidebar.warning("No valid dates found in data")
+    df_filtered = df_processed.copy()
+    st.sidebar.warning("No valid dates found in data for filtering.")
 
-# Additional filters
-machines = ['All'] + sorted(df_filtered['Machine number'].astype(str).unique().tolist())
-selected_machine = st.sidebar.selectbox("🔧 Machine", machines)
-if selected_machine != 'All':
-    df_filtered = df_filtered[df_filtered['Machine number'].astype(str) == selected_machine]
+# Additional filters (ensure columns exist before creating selectbox)
+filter_columns = {
+    'Machine number': '🔧 Machine',
+    'Shift': '⏰ Shift',
+    'Item code': '📦 Item Code',
+    'Operator name': '👨‍🔧 Operator Name',
+    'BMR Number': '📄 BMR Number'
+}
 
-shifts = ['All'] + sorted(df_filtered['Shift'].astype(str).unique().tolist())
-selected_shift = st.sidebar.selectbox("⏰ Shift", shifts)
-if selected_shift != 'All':
-    df_filtered = df_filtered[df_filtered['Shift'].astype(str) == selected_shift]
+for col_name, display_name in filter_columns.items():
+    if col_name in df_filtered.columns:
+        unique_values = ['All'] + sorted(df_filtered[col_name].astype(str).unique().tolist())
+        selected_value = st.sidebar.selectbox(display_name, unique_values, key=f"filter_{col_name}")
+        if selected_value != 'All':
+            df_filtered = df_filtered[df_filtered[col_name].astype(str) == selected_value]
+    else:
+        st.sidebar.caption(f"'{col_name}' column not found for filtering.")
 
 # Main Dashboard
 if df_filtered.empty:
-    st.error("❌ No data available for selected filters")
+    st.error("❌ No data available for the selected filters. Please adjust your filter criteria.")
     st.stop()
 
 # Executive Summary
@@ -311,222 +550,276 @@ st.markdown("## 📊 Executive Summary")
 kpis = create_executive_kpis(df_filtered)
 
 # KPI Cards
-col1, col2, col3, col4, col5, col6 = st.columns(6)
+cols_kpi = st.columns(7)  # Adjusted for new KPI
 
-with col1:
-    st.metric("Total Production", f"{int(kpis['total_production']):,}",
-              help="Total manufactured quantity")
-
-with col2:
+with cols_kpi[0]:
+    st.metric("Total Production", f"{int(kpis['total_production']):,}", help="Total manufactured quantity")
+with cols_kpi[1]:
     st.metric("Yield Rate", f"{kpis['overall_yield']:.1f}%",
               delta=f"{kpis['overall_yield'] - 95:.1f}%" if kpis['overall_yield'] < 95 else None,
-              help="Overall production yield")
-
-with col3:
+              help="Overall production yield (Approved Qty / Mfg Qty)")
+with cols_kpi[2]:
     st.metric("Rejection Rate", f"{kpis['overall_rejection']:.1f}%",
               delta=f"{kpis['overall_rejection'] - 5:.1f}%" if kpis['overall_rejection'] > 5 else None,
-              delta_color="inverse",
-              help="Overall rejection rate")
-
-with col4:
+              delta_color="inverse", help="Overall rejection rate (Rejected Qty / Mfg Qty)")
+with cols_kpi[3]:
     st.metric("Machine Utilization", f"{kpis['avg_machine_utilization']:.1f}%",
-              help="Average machine utilization")
-
-with col5:
-    st.metric("Breakdown Hours", f"{kpis['total_breakdown_hours']:.0f}h",
-              help="Total breakdown time")
-
-with col6:
-    st.metric("Unreported Hours", f"{kpis['total_unreported_hours']:.0f}h",
-              help="Total unreported time")
+              help="Avg. Machine Utilization (Running Time / (Run Time + Breakdown + Unreported))")
+with cols_kpi[4]:
+    st.metric("Breakdown Hours", f"{kpis['total_breakdown_hours']:.1f}h", help="Total breakdown time in hours")
+with cols_kpi[5]:
+    st.metric("Unreported Hours", f"{kpis['total_unreported_hours']:.1f}h", help="Total unreported time in hours")
+with cols_kpi[6]:
+    st.metric("Missing BD Forms", f"{int(kpis['missing_form_entries_count'])}",
+              help="Count of PRD records indicating breakdown but missing a form entry")
 
 st.markdown("---")
 
 # Critical Issues Analysis
 st.markdown("## 🚨 Critical Issues Analysis")
+col1_crit, col2_crit = st.columns(2)
 
-col1, col2 = st.columns(2)
-
-with col1:
-    st.markdown("### 🔧 Top Breakdown Reasons (Pareto Analysis)")
-    if df_filtered['Breakdown duration (in minutes)'].sum() > 0:
-        pareto_fig = create_pareto_chart(
-            df_filtered,
+with col1_crit:
+    st.markdown("### 🔧 Top Breakdown Reasons (Pareto)")
+    if 'Breakdown duration (in minutes)' in df_filtered.columns and 'Breakdown (entry)' in df_filtered.columns:
+        pareto_fig_bd = create_pareto_chart(
+            df_filtered[df_filtered['Breakdown (entry)'] != 'Not Specified'],  # Exclude 'Not Specified' from Pareto
             'Breakdown (entry)',
             'Breakdown duration (in minutes)',
-            'Breakdown Analysis - Focus on Top Issues'
+            'Top Breakdown Reasons by Duration'
         )
-        st.plotly_chart(pareto_fig, use_container_width=True)
+        if pareto_fig_bd:
+            st.plotly_chart(pareto_fig_bd, use_container_width=True)
+        else:
+            st.info("No breakdown data with specified reasons to display for Pareto chart.")
     else:
-        st.info("No breakdown data available")
+        st.info("Breakdown columns not available for Pareto chart.")
 
-with col2:
+with col2_crit:
     st.markdown("### ⏱️ Unreported Time by Machine")
-    unreported_machine = df_filtered.groupby('Machine number')['Unreported time'].sum().sort_values(
-        ascending=False).head(10)
-    if unreported_machine.sum() > 0:
-        fig = px.bar(x=unreported_machine.index, y=unreported_machine.values,
-                     title='Machines with Highest Unreported Time',
-                     labels={'x': 'Machine Number', 'y': 'Unreported Time (minutes)'},
-                     color=unreported_machine.values,
-                     color_continuous_scale='Reds')
-        st.plotly_chart(fig, use_container_width=True)
+    if 'Unreported time' in df_filtered.columns and 'Machine number' in df_filtered.columns:
+        unreported_machine = df_filtered.groupby('Machine number')['Unreported time'].sum().sort_values(
+            ascending=False).head(10)
+        unreported_machine = unreported_machine[unreported_machine > 0]  # Only show if time > 0
+        if not unreported_machine.empty:
+            fig_unreported = px.bar(unreported_machine,
+                                    x=unreported_machine.index, y=unreported_machine.values,
+                                    title='Machines with Highest Unreported Time',
+                                    labels={'index': 'Machine Number', 'y': 'Unreported Time (minutes)'},
+                                    color=unreported_machine.values, color_continuous_scale='Reds')
+            st.plotly_chart(fig_unreported, use_container_width=True)
+        else:
+            st.info("No unreported time data to display.")
     else:
-        st.info("No unreported time data available")
+        st.info("Unreported time or Machine number column not available.")
 
 # Quality Issues
 st.markdown("### 🎯 Quality Issues Analysis")
+col1_qual, col2_qual = st.columns(2)
 
-col1, col2 = st.columns(2)
-
-with col1:
+with col1_qual:
     st.markdown("#### Rejection Rate by Item")
-    rejection_by_item = df_filtered.groupby('Item code').agg({
-        'Mfg qty': 'sum',
-        'Rejected qty': 'sum'
-    })
-    rejection_by_item['Rejection Rate'] = (
-                rejection_by_item['Rejected qty'] / rejection_by_item['Mfg qty'] * 100).fillna(0)
-    rejection_by_item = rejection_by_item.sort_values('Rejection Rate', ascending=False).head(10)
+    if all(c in df_filtered.columns for c in ['Item code', 'Mfg qty', 'Rejected qty']):
+        rejection_by_item = df_filtered.groupby('Item code').agg(
+            Total_Mfg_Qty=('Mfg qty', 'sum'),
+            Total_Rejected_Qty=('Rejected qty', 'sum')
+        ).reset_index()
+        rejection_by_item['Rejection Rate (%)'] = np.where(
+            rejection_by_item['Total_Mfg_Qty'] > 0,
+            (rejection_by_item['Total_Rejected_Qty'] / rejection_by_item['Total_Mfg_Qty']) * 100,
+            0
+        )
+        rejection_by_item = rejection_by_item[rejection_by_item['Rejection Rate (%)'] > 0].sort_values(
+            'Rejection Rate (%)', ascending=False).head(10)
 
-    if not rejection_by_item.empty:
-        fig = px.bar(x=rejection_by_item.index, y=rejection_by_item['Rejection Rate'],
-                     title='Items with Highest Rejection Rates',
-                     labels={'x': 'Item Code', 'y': 'Rejection Rate (%)'},
-                     color=rejection_by_item['Rejection Rate'],
-                     color_continuous_scale='Reds')
-        st.plotly_chart(fig, use_container_width=True)
+        if not rejection_by_item.empty:
+            fig_rej_item = px.bar(rejection_by_item,
+                                  x='Item code', y='Rejection Rate (%)',
+                                  title='Top Items by Rejection Rate',
+                                  labels={'Item code': 'Item Code', 'Rejection Rate (%)': 'Rejection Rate (%)'},
+                                  color='Rejection Rate (%)', color_continuous_scale='OrRd')
+            st.plotly_chart(fig_rej_item, use_container_width=True)
+        else:
+            st.info("No items with rejections to display.")
     else:
-        st.info("No rejection data available")
+        st.info("Required columns for rejection analysis by item are missing.")
 
-with col2:
-    st.markdown("#### Production Efficiency by Operator")
-    operator_performance = df_filtered.groupby('Operator name').agg({
-        'Approved qty': 'sum',
-        'Rejected qty': 'sum',
-        'Running time': 'sum'
-    })
-    operator_performance['Efficiency'] = (operator_performance['Approved qty'] /
-                                          (operator_performance['Running time'] / 60)).fillna(0)
-    operator_performance = operator_performance.sort_values('Efficiency', ascending=False).head(10)
+with col2_qual:
+    st.markdown("#### Production Performance by Operator")
+    if all(c in df_filtered.columns for c in ['Operator name', 'Approved qty', 'Running time', 'Rejected qty']):
+        operator_perf = df_filtered.groupby('Operator name').agg(
+            Total_Approved_Qty=('Approved qty', 'sum'),
+            Total_Rejected_Qty=('Rejected qty', 'sum'),
+            Total_Running_Time_Mins=('Running time', 'sum')  # Assuming Running time is in minutes
+        ).reset_index()
+        operator_perf['Productivity (Approved Qty/Hr)'] = np.where(
+            operator_perf['Total_Running_Time_Mins'] > 0,
+            operator_perf['Total_Approved_Qty'] / (operator_perf['Total_Running_Time_Mins'] / 60),
+            0
+        )
+        operator_perf['Rejection Rate (%)'] = np.where(
+            (operator_perf['Total_Approved_Qty'] + operator_perf['Total_Rejected_Qty']) > 0,
+            (operator_perf['Total_Rejected_Qty'] / (
+                        operator_perf['Total_Approved_Qty'] + operator_perf['Total_Rejected_Qty'])) * 100,
+            0
+        )
+        operator_perf_sorted = operator_perf[operator_perf['Productivity (Approved Qty/Hr)'] > 0].sort_values(
+            'Productivity (Approved Qty/Hr)', ascending=False).head(10)
 
-    if not operator_performance.empty:
-        fig = px.bar(x=operator_performance.index, y=operator_performance['Efficiency'],
-                     title='Operator Efficiency (Parts/Hour)',
-                     labels={'x': 'Operator', 'y': 'Parts per Hour'},
-                     color=operator_performance['Efficiency'],
-                     color_continuous_scale='Greens')
-        st.plotly_chart(fig, use_container_width=True)
+        if not operator_perf_sorted.empty:
+            fig_op_perf = px.bar(operator_perf_sorted,
+                                 x='Operator name', y='Productivity (Approved Qty/Hr)',
+                                 title='Top Operators by Productivity (Approved Qty/Hour)',
+                                 labels={'Operator name': 'Operator',
+                                         'Productivity (Approved Qty/Hr)': 'Approved Parts per Hour'},
+                                 color='Productivity (Approved Qty/Hr)', color_continuous_scale='Greens')
+            st.plotly_chart(fig_op_perf, use_container_width=True)
+        else:
+            st.info("No operator performance data to display (check running times and approved quantities).")
     else:
-        st.info("No operator performance data available")
+        st.info("Required columns for operator performance analysis are missing.")
 
 # Trend Analysis
 st.markdown("## 📈 Trend Analysis")
+if 'Date' in df_filtered.columns and len(df_filtered['Date'].dropna()) > 1:
+    trend_metrics = ['Breakdown duration (in minutes)', 'Unreported time', 'Rejection Rate', 'Yield Rate',
+                     'Machine Utilization', 'Mfg qty']
+    # Filter out metrics not present in df_filtered
+    available_trend_metrics = [m for m in trend_metrics if m in df_filtered.columns]
 
-# Multi-metric trends
-if len(df_filtered) > 1:
-    trend_fig = create_trend_analysis(
-        df_filtered,
-        'Date',
-        ['Breakdown duration (in minutes)', 'Unreported time', 'Rejection Rate', 'Yield Rate'],
-        'Key Metrics Trend Analysis'
-    )
-    st.plotly_chart(trend_fig, use_container_width=True)
+    if available_trend_metrics:
+        trend_fig = create_trend_analysis(
+            df_filtered,
+            'Date',
+            available_trend_metrics,
+            'Key Metrics Over Time'
+        )
+        if trend_fig:
+            st.plotly_chart(trend_fig, use_container_width=True)
+        else:
+            st.info("Insufficient data for trend analysis after processing.")
+    else:
+        st.info("No suitable metrics found for trend analysis.")
+else:
+    st.info("Not enough date points or 'Date' column missing for trend analysis.")
 
 # Machine Performance Heatmap
-st.markdown("### 🔥 Machine Performance Heatmap")
-if len(df_filtered) > 0:
-    machine_daily = df_filtered.groupby(['Machine number', df_filtered['Date'].dt.date]).agg({
-        'Machine Utilization': 'mean',
-        'Breakdown duration (in minutes)': 'sum',
-        'Yield Rate': 'mean'
-    }).reset_index()
+st.markdown("### 🔥 Machine Performance Heatmap (Utilization %)")
+if all(c in df_filtered.columns for c in ['Machine number', 'Date', 'Machine Utilization']):
+    heatmap_data = df_filtered[df_filtered['Date'].notna() & df_filtered['Machine number'].notna()]
+    if not heatmap_data.empty:
+        machine_daily_util = heatmap_data.groupby([heatmap_data['Date'].dt.date, 'Machine number'])[
+            'Machine Utilization'].mean().reset_index()
+        if not machine_daily_util.empty:
+            pivot_util = machine_daily_util.pivot(index='Machine number', columns='Date', values='Machine Utilization')
+            if not pivot_util.empty:
+                # Sort columns (dates) and rows (machine numbers if numeric-like)
+                pivot_util = pivot_util.reindex(sorted(pivot_util.columns), axis=1)
+                try:  # Try to sort machine numbers numerically if they are like 'M1', 'M10'
+                    pivot_util = pivot_util.reindex(sorted(pivot_util.index, key=lambda x: int(
+                        str(x).replace('Machine', '').replace('M', '').strip()) if str(x).replace('Machine',
+                                                                                                  '').replace('M',
+                                                                                                              '').strip().isdigit() else float(
+                        'inf')))
+                except:
+                    pivot_util = pivot_util.sort_index()  # Fallback to alphabetical sort
 
-    if not machine_daily.empty:
-        # Create heatmap for machine utilization
-        pivot_util = machine_daily.pivot(index='Machine number', columns='Date', values='Machine Utilization')
-        fig = px.imshow(pivot_util,
-                        title='Machine Utilization Heatmap (%)',
-                        color_continuous_scale='RdYlGn',
-                        aspect='auto')
-        st.plotly_chart(fig, use_container_width=True)
+                fig_heatmap = px.imshow(pivot_util,
+                                        title='Machine Utilization Heatmap (%)',
+                                        color_continuous_scale='RdYlGn',  # Red-Yellow-Green
+                                        aspect='auto',
+                                        labels=dict(x="Date", y="Machine Number", color="Utilization %"))
+                fig_heatmap.update_xaxes(type='category')  # Treat dates as categories on x-axis for discrete blocks
+                st.plotly_chart(fig_heatmap, use_container_width=True)
+            else:
+                st.info("Not enough data to create a pivot table for the machine utilization heatmap.")
+        else:
+            st.info("No daily machine utilization data aggregated for the heatmap.")
+    else:
+        st.info("No valid data for machine utilization heatmap after filtering.")
+else:
+    st.info("Machine number, Date, or Machine Utilization column missing for heatmap.")
 
 # Action Items Table
 st.markdown("## 🎯 Priority Action Items")
-
-# Generate action items based on data
 action_items = []
 
 # Critical breakdown reasons
-top_breakdowns = df_filtered.groupby('Breakdown (entry)')['Breakdown duration (in minutes)'].sum().sort_values(
-    ascending=False).head(3)
-for reason, duration in top_breakdowns.items():
-    if duration > 0:
-        action_items.append({
-            'Priority': '🔴 High',
-            'Category': 'Breakdown',
-            'Issue': f'{reason}',
-            'Impact': f'{duration:.0f} minutes lost',
-            'Recommended Action': 'Investigate root cause and implement preventive measures'
-        })
+if 'Breakdown (entry)' in df_filtered.columns and 'Breakdown duration (in minutes)' in df_filtered.columns:
+    top_breakdowns = df_filtered[df_filtered['Breakdown (entry)'] != 'Not Specified'].groupby('Breakdown (entry)')[
+        'Breakdown duration (in minutes)'].sum().sort_values(ascending=False).head(3)
+    for reason, duration in top_breakdowns.items():
+        if duration > 0:
+            action_items.append({
+                'Priority': '🔴 High', 'Category': 'Breakdown',
+                'Issue': f"Top Breakdown: {reason}",
+                'Impact': f"{duration:.0f} minutes total lost",
+                'Recommended Action': 'Investigate root cause, implement corrective/preventive actions.'
+            })
 
-# High rejection items
-high_rejection_items = rejection_by_item.head(3)
-for item, row in high_rejection_items.iterrows():
-    if row['Rejection Rate'] > 5:
-        action_items.append({
-            'Priority': '🟡 Medium',
-            'Category': 'Quality',
-            'Issue': f'High rejection rate for {item}',
-            'Impact': f'{row["Rejection Rate"]:.1f}% rejection rate',
-            'Recommended Action': 'Review process parameters and quality controls'
-        })
+# High rejection items (using previously calculated rejection_by_item if available)
+if 'rejection_by_item' in locals() and not rejection_by_item.empty:
+    for index, row_item in rejection_by_item.head(3).iterrows():  # Iterate over top 3 from the chart data
+        if row_item['Rejection Rate (%)'] > 10:  # Example threshold
+            action_items.append({
+                'Priority': '🟡 Medium', 'Category': 'Quality',
+                'Issue': f"High Rejection: Item {row_item['Item code']}",
+                'Impact': f"{row_item['Rejection Rate (%)']:.1f}% rejection rate",
+                'Recommended Action': 'Review process parameters, material quality, and operator training for this item.'
+            })
 
-# High unreported time machines
-high_unreported = df_filtered.groupby('Machine number')['Unreported time'].sum().sort_values(ascending=False).head(3)
-for machine, time in high_unreported.items():
-    if time > 60:  # More than 1 hour
-        action_items.append({
-            'Priority': '🟠 Medium',
-            'Category': 'Efficiency',
-            'Issue': f'High unreported time for Machine {machine}',
-            'Impact': f'{time:.0f} minutes unreported',
-            'Recommended Action': 'Improve time tracking and operator training'
-        })
+# High unreported time machines (using previously calculated unreported_machine if available)
+if 'unreported_machine' in locals() and not unreported_machine.empty:
+    for machine, time_lost in unreported_machine.head(3).items():  # Iterate over top 3
+        if time_lost > 60:  # Example threshold: more than 1 hour
+            action_items.append({
+                'Priority': '🟠 Medium', 'Category': 'Efficiency',
+                'Issue': f"High Unreported Time: Machine {machine}",
+                'Impact': f"{time_lost:.0f} minutes unreported",
+                'Recommended Action': 'Investigate reasons for unreported time, improve time logging practices.'
+            })
+
+# Missing Breakdown Form Entries
+if 'Missing_Form_Entry' in df_filtered.columns and df_filtered['Missing_Form_Entry'].sum() > 0:
+    missing_count = df_filtered['Missing_Form_Entry'].sum()
+    action_items.append({
+        'Priority': '🔵 Low', 'Category': 'Data Integrity',
+        'Issue': f"{missing_count} PRD records flagged breakdown but no form entry",
+        'Impact': 'Potential underreporting of breakdown details.',
+        'Recommended Action': 'Review PRD records vs. Form submissions. Ensure operators complete forms for all breakdowns.'
+    })
 
 if action_items:
     action_df = pd.DataFrame(action_items)
-    st.dataframe(action_df, use_container_width=True)
+    st.dataframe(action_df, use_container_width=True, hide_index=True)
 else:
-    st.success("✅ No critical issues identified in current data")
+    st.success("✅ No critical action items automatically identified based on current thresholds.")
 
 # Data Export
 st.markdown("## 📥 Data Export")
-col1, col2 = st.columns(2)
+col1_exp, col2_exp = st.columns(2)
 
-with col1:
-    if st.button("📊 Download Summary Report"):
-        summary_data = {
-            'Date Range': kpis['date_range'],
-            'Total Production': kpis['total_production'],
-            'Yield Rate': f"{kpis['overall_yield']:.2f}%",
-            'Rejection Rate': f"{kpis['overall_rejection']:.2f}%",
-            'Breakdown Hours': f"{kpis['total_breakdown_hours']:.1f}",
-            'Unreported Hours': f"{kpis['total_unreported_hours']:.1f}",
-            'Machine Utilization': f"{kpis['avg_machine_utilization']:.1f}%"
-        }
-        st.json(summary_data)
+with col1_exp:
+    # Provide df_filtered for download as it reflects user's selections
+    csv_filtered = df_filtered.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="💾 Download Filtered Data (CSV)",
+        data=csv_filtered,
+        file_name=f"filtered_production_data_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv",
+    )
 
-with col2:
-    if st.button("📋 Download Filtered Data"):
-        csv = df_filtered.to_csv(index=False)
-        st.download_button(
-            label="💾 Download CSV",
-            data=csv,
-            file_name=f"manufacturing_data_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv"
-        )
+with col2_exp:
+    # Provide df_processed (pre-filter) for download
+    csv_processed = df_processed.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📋 Download All Processed Data (CSV)",
+        data=csv_processed,
+        file_name=f"all_processed_production_data_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv",
+    )
 
 # Footer
 st.markdown("---")
-st.markdown("*Dashboard last updated: " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "*")
+st.markdown(
+    f"*Dashboard reflects data up to {df_processed['Date'].max().strftime('%Y-%m-%d') if not df_processed['Date'].dropna().empty else 'N/A'}. Last refreshed: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
