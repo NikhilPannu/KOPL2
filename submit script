@@ -1,0 +1,107 @@
+/**
+ * Consolidates data from the 'DataEntry' sheet to the 'MainDB' sheet.
+ * Clears the 'DataEntry' sheet after consolidation (keeping headers).
+ * Adds a timestamp to the transferred data in 'MainDB'.
+ * Re-applies formulas from the 'Formulas' sheet or clears columns in 'DataEntry'.
+ */
+function consolidateData() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const mainDbSheet = ss.getSheetByName('Database');
+  const dataEntrySheet = ss.getSheetByName('DailyEntry');
+  const formulasSheet = ss.getSheetByName('Formulas');
+
+  const firstDataRow = 2; // Assuming header is in row 1 for DataEntry and Formulas sheets
+  const rowsToApplyFormulas = 30; // The number of rows to apply formulas/blanks to
+
+  if (!mainDbSheet || !dataEntrySheet || !formulasSheet) {
+    Browser.msgBox("Error", "One or more required sheets (MainDB, DataEntry, Formulas) not found. Please check tab names.", Browser.Buttons.OK);
+    return;
+  }
+
+  // --- Data Consolidation Part ---
+  const lastRow = dataEntrySheet.getLastRow();
+  const dataEntryLastColumn = dataEntrySheet.getLastColumn(); // Number of columns in DataEntry
+
+  if (lastRow < firstDataRow) {
+    Logger.log("No new data found in the 'DataEntry' sheet to transfer.");
+  } else {
+    const dataRange = dataEntrySheet.getRange(firstDataRow, 1, lastRow - (firstDataRow - 1), dataEntryLastColumn);
+    let dataToTransfer = dataRange.getValues();
+
+    const timestamp = new Date();
+    dataToTransfer = dataToTransfer.map(row => {
+      if (row.length < dataEntryLastColumn) {
+        for (let i = row.length; i < dataEntryLastColumn; i++) {
+          row.push('');
+        }
+      }
+      row.push(timestamp);
+      return row;
+    });
+
+    mainDbSheet.getRange(mainDbSheet.getLastRow() + 1, 1, dataToTransfer.length, dataToTransfer[0].length).setValues(dataToTransfer);
+    dataEntrySheet.getRange(firstDataRow, 1, lastRow - (firstDataRow - 1), dataEntryLastColumn).clearContent();
+    Logger.log("Data consolidated.");
+  }
+
+  // --- Formula Re-application / Column Clearing Part ---
+  Logger.log("Starting formula re-application / column clearing.");
+
+  // Get the master row of formulas (R1C1 notation) from the 'Formulas' sheet
+  // Ensure this row in 'Formulas' has truly blank cells for manual input columns
+  const formulaRowRange = formulasSheet.getRange(firstDataRow, 1, 1, dataEntryLastColumn);
+  const masterFormulasR1C1 = formulaRowRange.getFormulasR1C1()[0];
+
+  Logger.log("Master formulas/blanks retrieved from 'Formulas' tab (R1C1): " + JSON.stringify(masterFormulasR1C1));
+
+  let allColumnsProcessedSuccessfully = true;
+
+  for (let colIndex = 0; colIndex < dataEntryLastColumn; colIndex++) {
+    const currentColumn = colIndex + 1; // Sheet columns are 1-indexed
+    const formulaForThisColumnR1C1 = masterFormulasR1C1[colIndex];
+    const targetColumnRange = dataEntrySheet.getRange(firstDataRow, currentColumn, rowsToApplyFormulas, 1);
+
+    if (formulaForThisColumnR1C1 && formulaForThisColumnR1C1.trim() !== "") {
+      // This column has a formula to apply
+      const columnFormulasArray = [];
+      for (let i = 0; i < rowsToApplyFormulas; i++) {
+        columnFormulasArray.push([formulaForThisColumnR1C1]); // Each formula needs to be in its own array for setFormulasR1C1
+      }
+      try {
+        Logger.log(`Applying formula "${formulaForThisColumnR1C1}" to column ${currentColumn} (${targetColumnRange.getA1Notation()})`);
+        targetColumnRange.setFormulasR1C1(columnFormulasArray);
+      } catch (e) {
+        Logger.log(`ERROR applying formula to column ${currentColumn}: ${e.toString()}. Formula: ${formulaForThisColumnR1C1}`);
+        allColumnsProcessedSuccessfully = false;
+        // Optional: Fill the column with an error message in the sheet, or leave as is
+        // targetColumnRange.setValue(`Error in formula for this col. Check Logs.`);
+      }
+    } else {
+      // This column is intended to be blank (no formula in 'Formulas' sheet or it's empty)
+      try {
+        Logger.log(`Clearing content for column ${currentColumn} (${targetColumnRange.getA1Notation()}) as no formula is specified.`);
+        targetColumnRange.clearContent(); // Explicitly clear the content
+      } catch (e) {
+        Logger.log(`ERROR clearing column ${currentColumn}: ${e.toString()}`);
+        allColumnsProcessedSuccessfully = false;
+      }
+    }
+  }
+
+  if (allColumnsProcessedSuccessfully) {
+    Browser.msgBox("Success", "Data consolidated. Formulas re-applied and blank columns cleared in 'DataEntry' sheet!", Browser.Buttons.OK);
+  } else {
+    Browser.msgBox("Partial Success", "Data consolidated, but some issues occurred applying formulas or clearing columns. Please check the logs (Extensions > Apps Script > Executions).", Browser.Buttons.OK);
+  }
+  Logger.log("Formula re-application / column clearing process completed.");
+}
+
+/**
+ * Creates a custom menu in the Google Sheet for manual data consolidation.
+ */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Submit')
+    .addItem('Consolidate Data Now', 'consolidateData')
+    .addToUi();
+}
